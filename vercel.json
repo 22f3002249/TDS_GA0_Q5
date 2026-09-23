@@ -1,0 +1,6 @@
+{
+  "rewrites": [
+    { "source": "/code-interpreter", "destination": "/api/index" },
+    { "source": "/(.*)", "destination": "/api/index" }
+  ]
+}
