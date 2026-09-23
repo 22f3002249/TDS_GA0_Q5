@@ -1,88 +1,124 @@
 import os
 import sys
-import io
-import traceback
 import json
+import traceback
+import urllib.request
+import urllib.error
+from io import StringIO
 from typing import List
-from fastapi import FastAPI, Body
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI
 
-app = FastAPI()
+app = FastAPI(title="Code Interpreter API")
 
-# Enable CORS for the evaluator
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)
-
-# AI Pipe Setup
-# The token will be pulled from Vercel Environment Variables
-client = OpenAI(
-    base_url="https://aipipe.org/openrouter/v1",
-    api_key=os.environ.get("AIPIPE_TOKEN")
 )
 
 class CodeRequest(BaseModel):
     code: str
 
+class CodeResponse(BaseModel):
+    error: List[int]
+    result: str
+
+
 def execute_python_code(code: str) -> dict:
+    """Executes Python code and captures exact stdout and traceback."""
     old_stdout = sys.stdout
-    redirected_output = sys.stdout = io.StringIO()
+    sys.stdout = StringIO()
+
     try:
-        # Using a dictionary for globals to persist state across lines
-        exec_scope = {}
-        exec(code, exec_scope)
-        output = redirected_output.getvalue()
+        exec_globals = {}
+        exec(code, exec_globals)
+        output = sys.stdout.getvalue()
         return {"success": True, "output": output}
     except Exception:
-        # Capture the standard traceback string
         output = traceback.format_exc()
         return {"success": False, "output": output}
     finally:
         sys.stdout = old_stdout
 
+
 def analyze_error_with_ai(code: str, error_traceback: str) -> List[int]:
-    prompt = f"""
-Analyze this Python code and its error traceback.
-Identify the line number(s) (1-indexed) where the error occurred.
+    """Uses AI Pipe (or fallback extraction) to get exact error lines."""
+    api_key = os.environ.get("AIPIPE_API_KEY") or os.environ.get("OPENAI_API_KEY")
 
-CODE:
-{code}
+    if api_key:
+        try:
+            url = os.environ.get("AIPIPE_BASE_URL", "https://api.aipipe.org/v1/chat/completions")
+            if not url.endswith("/chat/completions"):
+                url = url.rstrip("/") + "/chat/completions"
 
-TRACEBACK:
-{error_traceback}
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}"
+            }
 
-Return ONLY a JSON object with the key "error_lines" containing a list of integers.
-Example: {{"error_lines": [3]}}
-"""
-    try:
-        response = client.chat.completions.create(
-            model="google/gemini-2.0-flash-lite-001",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}
-        )
-        content = response.choices[0].message.content
-        result = json.loads(content)
-        return result.get("error_lines", [])
-    except:
-        return []
+            payload = {
+                "model": os.environ.get("AIPIPE_MODEL", "gpt-4o-mini"),
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a Python debugging assistant. Output strictly a JSON object with key 'error_lines' containing an array of integers representing the 1-indexed line number(s) in the user's code where the error occurred. Example: {\"error_lines\": [3]}"
+                    },
+                    {
+                        "role": "user",
+                        "content": f"CODE:\n{code}\n\nTRACEBACK:\n{error_traceback}\n\nExtract the line number(s) in the original user code."
+                    }
+                ],
+                "response_format": {"type": "json_object"}
+            }
 
-@app.post("/code-interpreter")
-async def interpreter(payload: CodeRequest):
-    execution = execute_python_code(payload.code)
-    
-    if execution["success"]:
-        return {"error": [], "result": execution["output"]}
-    
-    # Only call AI if execution failed
-    error_lines = analyze_error_with_ai(payload.code, execution["output"])
-    return {"error": error_lines, "result": execution["output"]}
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST"
+            )
+
+            with urllib.request.urlopen(req, timeout=10) as response:
+                resp_data = json.loads(response.read().decode("utf-8"))
+                content = resp_data["choices"][0]["message"]["content"]
+                parsed = json.loads(content)
+                if "error_lines" in parsed and isinstance(parsed["error_lines"], list):
+                    return parsed["error_lines"]
+        except Exception as e:
+            print("AI call error:", e)
+
+    # Reliable fallback directly from traceback
+    extracted_lines = []
+    for line in error_traceback.splitlines():
+        if "line " in line:
+            parts = line.split("line ")
+            if len(parts) > 1:
+                try:
+                    num = int(parts[1].split(",")[0].split()[0])
+                    extracted_lines.append(num)
+                except ValueError:
+                    pass
+
+    return extracted_lines if extracted_lines else [1]
+
 
 @app.get("/")
-async def health():
-    return {"status": "interpreter online"}
+def home():
+    return {"status": "ok", "message": "Code Interpreter API is running"}
+
+
+@app.post("/code-interpreter", response_model=CodeResponse)
+def code_interpreter(req: CodeRequest):
+    exec_result = execute_python_code(req.code)
+
+    if exec_result["success"]:
+        return CodeResponse(error=[], result=exec_result["output"])
+
+    error_lines = analyze_error_with_ai(req.code, exec_result["output"])
+    return CodeResponse(error=error_lines, result=exec_result["output"])
