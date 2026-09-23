@@ -1,6 +1,15 @@
 {
-  "rewrites": [
-    { "source": "/code-interpreter", "destination": "/api/index" },
-    { "source": "/(.*)", "destination": "/api/index" }
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/index.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "source": "/(.*)",
+      "dest": "api/index.py"
+    }
   ]
 }
